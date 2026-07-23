@@ -1,0 +1,83 @@
+name: Laguna DFlash compatibility
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - common/speculative.cpp
+      - src/llama-arch.h
+      - src/llama-arch.cpp
+      - src/models/models.h
+      - src/models/dflash.cpp
+      - tools/apply_laguna_dflash_compat.py
+      - tools/port_laguna_dflash_compat.sh
+      - .github/workflows/port-laguna-dflash.yml
+
+permissions:
+  contents: write
+
+jobs:
+  port-and-build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/laguna-dflash-compat
+          fetch-depth: 0
+
+      - name: Fetch Poolside Laguna reference
+        run: |
+          git remote add poolside https://github.com/poolsideai/llama.cpp.git
+          git fetch --depth=1 poolside laguna
+          git show FETCH_HEAD:src/models/dflash.cpp > "$RUNNER_TEMP/poolside-dflash.cpp"
+
+      - name: Apply compatibility port
+        run: |
+          python3 tools/apply_laguna_dflash_compat.py \
+            --poolside-dflash "$RUNNER_TEMP/poolside-dflash.cpp"
+          git diff --check
+
+      - name: Configure CPU compile check
+        run: |
+          cmake -S . -B build-port-check \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_HIP=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile core and common libraries
+        id: compile
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if ! cmake --build build-port-check --target llama llama-common -j2 > compile.log 2>&1; then
+            grep -E -B3 -A8 '(^|: )(fatal error|error):|FAILED:|undefined reference' compile.log || tail -n 180 compile.log
+            exit 1
+          fi
+          tail -n 50 compile.log
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laguna-dflash-compile-log
+          path: compile.log
+
+      - name: Stop on compile error
+        if: steps.compile.outcome == 'failure'
+        run: exit 1
+
+      - name: Commit generated source port
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add common/speculative.cpp src/llama-arch.h src/llama-arch.cpp src/models/models.h src/models/dflash.cpp
+          if ! git diff --cached --quiet; then
+            git commit -m "complete Laguna DFlash runtime compatibility"
+            git push origin HEAD:agent/laguna-dflash-compat
+          fi
