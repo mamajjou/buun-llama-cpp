@@ -47,16 +47,15 @@ jobs:
             -DGGML_HIP=OFF \
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=ON \
             -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Compile llama-cli
+      - name: Compile core and common libraries
         id: compile
         continue-on-error: true
         run: |
           set -o pipefail
-          if ! cmake --build build-port-check --target llama-cli -j2 > compile.log 2>&1; then
+          if ! cmake --build build-port-check --target llama llama-common -j2 > compile.log 2>&1; then
             grep -E -B3 -A8 '(^|: )(fatal error|error):|FAILED:|undefined reference' compile.log || tail -n 180 compile.log
             exit 1
           fi
