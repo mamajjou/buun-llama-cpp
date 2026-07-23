@@ -30,7 +30,6 @@ jobs:
             -DGGML_HIP=OFF \
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
