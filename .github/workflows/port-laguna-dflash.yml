@@ -1,9 +1,9 @@
 name: Laguna DFlash compatibility
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/laguna-dflash-compat
+      - master
     paths:
       - src/llama-arch.h
       - src/llama-arch.cpp
@@ -39,7 +39,11 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          cmake --build build-port-check --target llama-cli -j2 2>&1 | tee compile.log
+          if ! cmake --build build-port-check --target llama-cli -j2 > compile.log 2>&1; then
+            grep -E -B3 -A8 '(^|: )(fatal error|error):|FAILED:|undefined reference' compile.log || tail -n 160 compile.log
+            exit 1
+          fi
+          tail -n 40 compile.log
 
       - name: Upload compile log
         if: always()
