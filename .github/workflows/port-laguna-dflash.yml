@@ -39,6 +39,16 @@ jobs:
             --poolside-dflash "$RUNNER_TEMP/poolside-dflash.cpp"
           git diff --check
 
+      - name: Commit generated source port
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/llama-arch.h src/llama-arch.cpp src/models/models.h src/models/dflash.cpp
+          if ! git diff --cached --quiet; then
+            git commit -m "support Laguna DFlash decoder tensors"
+            git push origin HEAD:agent/laguna-dflash-compat
+          fi
+
       - name: Configure CPU compile check
         run: |
           cmake -S . -B build-port-check \
@@ -53,11 +63,3 @@ jobs:
 
       - name: Compile llama-cli
         run: cmake --build build-port-check --target llama-cli -j2
-
-      - name: Commit generated source port
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/llama-arch.h src/llama-arch.cpp src/models/models.h src/models/dflash.cpp
-          git commit -m "support Laguna DFlash decoder tensors"
-          git push origin HEAD:agent/laguna-dflash-compat
