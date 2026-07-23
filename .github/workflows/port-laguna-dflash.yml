@@ -7,6 +7,12 @@ on:
     paths:
       - tools/apply_laguna_dflash_compat.py
       - .github/workflows/port-laguna-dflash.yml
+  pull_request:
+    branches:
+      - master
+    paths:
+      - tools/apply_laguna_dflash_compat.py
+      - .github/workflows/port-laguna-dflash.yml
 
 permissions:
   contents: write
