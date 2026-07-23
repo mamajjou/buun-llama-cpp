@@ -1,0 +1,57 @@
+name: Port Laguna DFlash compatibility
+
+on:
+  push:
+    branches:
+      - agent/laguna-dflash-compat
+    paths:
+      - tools/apply_laguna_dflash_compat.py
+      - .github/workflows/port-laguna-dflash.yml
+
+permissions:
+  contents: write
+
+jobs:
+  port-and-build:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/laguna-dflash-compat
+          fetch-depth: 0
+
+      - name: Fetch Poolside Laguna reference
+        run: |
+          git remote add poolside https://github.com/poolsideai/llama.cpp.git
+          git fetch --depth=1 poolside laguna
+          git show FETCH_HEAD:src/models/dflash.cpp > "$RUNNER_TEMP/poolside-dflash.cpp"
+
+      - name: Apply compatibility port
+        run: |
+          python3 tools/apply_laguna_dflash_compat.py \
+            --poolside-dflash "$RUNNER_TEMP/poolside-dflash.cpp"
+          git diff --check
+
+      - name: Configure CPU compile check
+        run: |
+          cmake -S . -B build-port-check \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_HIP=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile llama-cli
+        run: cmake --build build-port-check --target llama-cli -j2
+
+      - name: Commit generated source port
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/llama-arch.h src/llama-arch.cpp src/models/models.h src/models/dflash.cpp
+          git commit -m "support Laguna DFlash decoder tensors"
+          git push origin HEAD:agent/laguna-dflash-compat
