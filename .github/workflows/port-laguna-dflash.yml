@@ -1,53 +1,26 @@
-name: Port Laguna DFlash compatibility
+name: Laguna DFlash compatibility
 
 on:
   push:
     branches:
       - agent/laguna-dflash-compat
     paths:
+      - src/llama-arch.h
+      - src/llama-arch.cpp
+      - src/models/models.h
+      - src/models/dflash.cpp
       - tools/apply_laguna_dflash_compat.py
-      - .github/workflows/port-laguna-dflash.yml
-  pull_request:
-    branches:
-      - master
-    paths:
-      - tools/apply_laguna_dflash_compat.py
+      - tools/port_laguna_dflash_compat.sh
       - .github/workflows/port-laguna-dflash.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  port-and-build:
-    if: github.actor != 'github-actions[bot]'
+  build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: agent/laguna-dflash-compat
-          fetch-depth: 0
-
-      - name: Fetch Poolside Laguna reference
-        run: |
-          git remote add poolside https://github.com/poolsideai/llama.cpp.git
-          git fetch --depth=1 poolside laguna
-          git show FETCH_HEAD:src/models/dflash.cpp > "$RUNNER_TEMP/poolside-dflash.cpp"
-
-      - name: Apply compatibility port
-        run: |
-          python3 tools/apply_laguna_dflash_compat.py \
-            --poolside-dflash "$RUNNER_TEMP/poolside-dflash.cpp"
-          git diff --check
-
-      - name: Commit generated source port
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/llama-arch.h src/llama-arch.cpp src/models/models.h src/models/dflash.cpp
-          if ! git diff --cached --quiet; then
-            git commit -m "support Laguna DFlash decoder tensors"
-            git push origin HEAD:agent/laguna-dflash-compat
-          fi
 
       - name: Configure CPU compile check
         run: |
@@ -62,4 +35,19 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Compile llama-cli
-        run: cmake --build build-port-check --target llama-cli -j2
+        id: compile
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cmake --build build-port-check --target llama-cli -j2 2>&1 | tee compile.log
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: laguna-dflash-compile-log
+          path: compile.log
+
+      - name: Fail on compile error
+        if: steps.compile.outcome == 'failure'
+        run: exit 1
