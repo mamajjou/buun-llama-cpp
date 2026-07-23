@@ -18,9 +18,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
-    hparams.dflash_n_target_layers = (uint32_t) target_layer_ids.size();
-    hparams.dflash_n_target_features = hparams.dflash_n_target_layers * hparams.n_embd;
-    hparams.n_embd_inp_enc_impl = hparams.dflash_n_target_features;
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);
     for (size_t i = 0; i < target_layer_ids.size(); ++i) {
