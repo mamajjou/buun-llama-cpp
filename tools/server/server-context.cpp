@@ -337,6 +337,21 @@ struct server_slot {
     int64_t t_spec_verify_us = 0;
     int64_t t_spec_recovery_us = 0;
 
+    // draft-dflash is profitable only when a verified block amortizes its
+    // extra drafter + batched-target pass. Calibrate against one ordinary
+    // target token at the request's actual context, then make request-local
+    // decisions from measured block wall time. These fields must never survive
+    // slot reuse: a cached prefix can have a radically different decode cost.
+    bool spec_adaptive_baseline_ready = false;
+    bool spec_adaptive_disabled = false;
+    int32_t spec_adaptive_decisions = 0;
+    int32_t spec_adaptive_window_blocks = 0;
+    int32_t spec_adaptive_window_outputs = 0;
+    int64_t spec_adaptive_target_us = 0;
+    int64_t spec_adaptive_window_us = 0;
+    int64_t spec_adaptive_block_start_us = 0;
+    double spec_adaptive_last_ratio = 0.0;
+
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
     llama_seq_id seq_id_backup = -1;
@@ -375,6 +390,15 @@ struct server_slot {
         t_spec_draft_us = 0;
         t_spec_verify_us = 0;
         t_spec_recovery_us = 0;
+        spec_adaptive_baseline_ready = false;
+        spec_adaptive_disabled = false;
+        spec_adaptive_decisions = 0;
+        spec_adaptive_window_blocks = 0;
+        spec_adaptive_window_outputs = 0;
+        spec_adaptive_target_us = 0;
+        spec_adaptive_window_us = 0;
+        spec_adaptive_block_start_us = 0;
+        spec_adaptive_last_ratio = 0.0;
         has_draft_backup = false;
         seq_id_backup = -1;
         n_tokens_before_draft = 0;
@@ -468,6 +492,11 @@ struct server_slot {
         return spec || spec_shared;
     }
 
+    bool uses_adaptive_dflash() const {
+        return can_speculate() && task &&
+            task->params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+    }
+
     common_speculative * get_spec() const {
         return spec ? spec.get() : spec_shared;
     }
@@ -485,6 +514,15 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // The first post-prefill token is deliberately decoded normally to
+        // calibrate target latency. A losing request then remains target-only,
+        // while common_speculative_update_logits() keeps the DFlash ring
+        // synchronized on every ordinary token. Output is always target sampled.
+        if (uses_adaptive_dflash() &&
+            (!spec_adaptive_baseline_ready || spec_adaptive_disabled)) {
             return 0;
         }
 
@@ -598,6 +636,10 @@ struct server_slot {
             timings.draft_ms = t_spec_draft_us / 1e3;
             timings.draft_verify_ms = t_spec_verify_us / 1e3;
             timings.draft_recovery_ms = t_spec_recovery_us / 1e3;
+            timings.draft_adaptive_disabled = spec_adaptive_disabled;
+            timings.draft_adaptive_decisions = spec_adaptive_decisions;
+            timings.draft_target_token_ms = spec_adaptive_target_us / 1e3;
+            timings.draft_adaptive_last_ratio = spec_adaptive_last_ratio;
         }
 
         // live effective KV bits/value (moves under dynamic VBR as tiers degrade/reset)
@@ -4026,6 +4068,9 @@ private:
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
+                if (slot.uses_adaptive_dflash()) {
+                    slot.spec_adaptive_block_start_us = t_draft_slot_start;
+                }
                 slot.n_draft_attempts++;
 
                 llama_tokens draft;
@@ -4889,6 +4934,28 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        // A draft-dflash request starts with one ordinary post-prefill target
+        // decode. It measures the target token cost at the live context and KV
+        // state; using a fixed global latency would make cache-reused Pi turns
+        // choose from the wrong break-even point. Parallel=1 is the supported
+        // production contract, so require an isolated one-token decode.
+        if (batch_view.n_tokens == 1 && batch_view.n_seq_id[0] == 1) {
+            const llama_seq_id seq_id = batch_view.seq_id[0][0];
+            if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size()) {
+                auto & slot = slots[seq_id];
+                if (slot.state == SLOT_STATE_GENERATING &&
+                    slot.uses_adaptive_dflash() &&
+                    !slot.spec_adaptive_baseline_ready &&
+                    slot.spec_draft.empty() &&
+                    slot.n_decoded > 0) {
+                    slot.spec_adaptive_target_us = std::max<int64_t>(1, t_verify_elapsed);
+                    slot.spec_adaptive_baseline_ready = true;
+                    SLT_INF(slot, "adaptive draft-dflash target baseline: %.2f ms/token\n",
+                            slot.spec_adaptive_target_us / 1e3);
+                }
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -5254,6 +5321,53 @@ private:
 
             common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t)(ids.size() - 1));
             slot.t_spec_recovery_us += ggml_time_us() - t_recovery_start;
+
+            if (slot.uses_adaptive_dflash() && slot.spec_adaptive_block_start_us > 0) {
+                const int64_t block_us = ggml_time_us() - slot.spec_adaptive_block_start_us;
+                slot.spec_adaptive_block_start_us = 0;
+                slot.spec_adaptive_window_blocks++;
+                slot.spec_adaptive_window_outputs += ids.size(); // accepted draft tokens + target bonus
+                slot.spec_adaptive_window_us += block_us;
+
+                // Four blocks reject a losing phase quickly; profitable phases
+                // are rechecked in eight-block windows. The 0.97 margin requires
+                // a measured 3% win before keeping the extra model active.
+                const int decision_blocks = slot.spec_adaptive_decisions == 0 ? 4 : 8;
+                if (slot.spec_adaptive_window_blocks >= decision_blocks &&
+                    slot.spec_adaptive_window_outputs > 0 &&
+                    slot.spec_adaptive_target_us > 0) {
+                    const double target_only_us =
+                        (double) slot.spec_adaptive_target_us * slot.spec_adaptive_window_outputs;
+                    slot.spec_adaptive_last_ratio =
+                        slot.spec_adaptive_window_us / target_only_us;
+                    slot.spec_adaptive_decisions++;
+
+                    if (slot.spec_adaptive_last_ratio > 0.97) {
+                        slot.spec_adaptive_disabled = true;
+                        SLT_INF(slot,
+                                "adaptive draft-dflash disabled: blocks=%d outputs=%d "
+                                "spec=%.2f ms target-est=%.2f ms ratio=%.3f\n",
+                                slot.spec_adaptive_window_blocks,
+                                slot.spec_adaptive_window_outputs,
+                                slot.spec_adaptive_window_us / 1e3,
+                                target_only_us / 1e3,
+                                slot.spec_adaptive_last_ratio);
+                    } else {
+                        SLT_DBG(slot,
+                                "adaptive draft-dflash retained: blocks=%d outputs=%d "
+                                "spec=%.2f ms target-est=%.2f ms ratio=%.3f\n",
+                                slot.spec_adaptive_window_blocks,
+                                slot.spec_adaptive_window_outputs,
+                                slot.spec_adaptive_window_us / 1e3,
+                                target_only_us / 1e3,
+                                slot.spec_adaptive_last_ratio);
+                    }
+
+                    slot.spec_adaptive_window_blocks = 0;
+                    slot.spec_adaptive_window_outputs = 0;
+                    slot.spec_adaptive_window_us = 0;
+                }
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

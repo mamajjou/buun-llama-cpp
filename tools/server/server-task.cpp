@@ -279,6 +279,10 @@ json result_timings::to_json() const {
         base["draft_ms"] = draft_ms;
         base["draft_verify_ms"] = draft_verify_ms;
         base["draft_recovery_ms"] = draft_recovery_ms;
+        base["draft_adaptive_disabled"] = draft_adaptive_disabled;
+        base["draft_adaptive_decisions"] = draft_adaptive_decisions;
+        base["draft_target_token_ms"] = draft_target_token_ms;
+        base["draft_adaptive_last_ratio"] = draft_adaptive_last_ratio;
     }
 
     if (kv_bpv >= 0.0) {

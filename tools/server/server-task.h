@@ -285,6 +285,10 @@ struct result_timings {
     double draft_ms = 0.0;
     double draft_verify_ms = 0.0;
     double draft_recovery_ms = 0.0;
+    bool draft_adaptive_disabled = false;
+    int32_t draft_adaptive_decisions = 0;
+    double draft_target_token_ms = 0.0;
+    double draft_adaptive_last_ratio = 0.0;
 
     // effective bits/value of the attention KV cache at its current tensor types (moves at
     // runtime under dynamic VBR); emitted only when >= 0
