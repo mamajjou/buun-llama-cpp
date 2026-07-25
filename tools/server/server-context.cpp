@@ -5364,11 +5364,11 @@ private:
                 slot.spec_adaptive_window_outputs += ids.size(); // accepted draft tokens + target bonus
                 slot.spec_adaptive_window_us += block_us;
 
-                // Three blocks reject a losing phase quickly; profitable phases
+                // Two blocks reject a losing phase quickly; profitable phases
                 // are rechecked in eight-block windows. Requiring a predicted
                 // 10% win covers short-block boundary cost and matches the
                 // production success threshold.
-                const int decision_blocks = slot.spec_adaptive_decisions == 0 ? 3 : 8;
+                const int decision_blocks = slot.spec_adaptive_decisions == 0 ? 2 : 8;
                 if (slot.spec_adaptive_window_blocks >= decision_blocks &&
                     slot.spec_adaptive_window_outputs > 0 &&
                     slot.spec_adaptive_target_us > 0) {
