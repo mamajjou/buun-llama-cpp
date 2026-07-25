@@ -499,6 +499,16 @@ struct server_slot {
     }
 
     bool uses_adaptive_dflash() const {
+        // Diagnostic override: LLAMA_DFLASH_NO_ADAPTIVE=1 forces always-on
+        // draft-dflash so grammar/tool-boundary acceptance can be measured
+        // without the 32-token calibration tax or kill-switch.
+        static const bool no_adaptive = []() {
+            const char * env = getenv("LLAMA_DFLASH_NO_ADAPTIVE");
+            return env != nullptr && env[0] == '1';
+        }();
+        if (no_adaptive) {
+            return false;
+        }
         return can_speculate() && task &&
             task->params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
     }
