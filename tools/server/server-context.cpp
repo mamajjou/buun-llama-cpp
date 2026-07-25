@@ -348,6 +348,7 @@ struct server_slot {
     int32_t spec_adaptive_window_blocks = 0;
     int32_t spec_adaptive_window_outputs = 0;
     int64_t spec_adaptive_target_us = 0;
+    int64_t spec_adaptive_target_start_us = 0;
     int64_t spec_adaptive_window_us = 0;
     int64_t spec_adaptive_block_start_us = 0;
     double spec_adaptive_last_ratio = 0.0;
@@ -396,6 +397,7 @@ struct server_slot {
         spec_adaptive_window_blocks = 0;
         spec_adaptive_window_outputs = 0;
         spec_adaptive_target_us = 0;
+        spec_adaptive_target_start_us = 0;
         spec_adaptive_window_us = 0;
         spec_adaptive_block_start_us = 0;
         spec_adaptive_last_ratio = 0.0;
@@ -540,6 +542,13 @@ struct server_slot {
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
+        }
+
+        // The first profitability window uses one-token proposals. This bounds
+        // the cost of short tool/special-token transitions that may finish
+        // before a four-block decision, then expands to the requested depth.
+        if (uses_adaptive_dflash() && spec_adaptive_decisions == 0) {
+            n_draft_max = std::min(n_draft_max, 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -4078,7 +4087,10 @@ private:
                     draft = std::move(batched_drafts[slot.id]);
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-                    const auto & params_spec = slot.task->params.speculative;
+                    auto params_spec = slot.task->params.speculative;
+                    if (slot.uses_adaptive_dflash() && slot.spec_adaptive_decisions == 0) {
+                        params_spec.n_max = std::min(params_spec.n_max, 1);
+                    }
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
                     draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
                 }
@@ -4948,10 +4960,10 @@ private:
                     !slot.spec_adaptive_baseline_ready &&
                     slot.spec_draft.empty() &&
                     slot.n_decoded > 0) {
-                    slot.spec_adaptive_target_us = std::max<int64_t>(1, t_verify_elapsed);
-                    slot.spec_adaptive_baseline_ready = true;
-                    SLT_INF(slot, "adaptive draft-dflash target baseline: %.2f ms/token\n",
-                            slot.spec_adaptive_target_us / 1e3);
+                    // Sampling below synchronizes the target logits. Keep the
+                    // decode start here and finish the measurement only after
+                    // common_sampler_sample() has forced GPU completion.
+                    slot.spec_adaptive_target_start_us = t_verify_start;
                 }
             }
         }
@@ -5157,6 +5169,17 @@ private:
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
+
+            if (slot.uses_adaptive_dflash() &&
+                !slot.spec_adaptive_baseline_ready &&
+                slot.spec_adaptive_target_start_us > 0) {
+                slot.spec_adaptive_target_us =
+                    std::max<int64_t>(1, t_now - slot.spec_adaptive_target_start_us);
+                slot.spec_adaptive_target_start_us = 0;
+                slot.spec_adaptive_baseline_ready = true;
+                SLT_INF(slot, "adaptive draft-dflash target baseline: %.2f ms/token\n",
+                        slot.spec_adaptive_target_us / 1e3);
+            }
 
             slot.n_decoded += 1;
 
