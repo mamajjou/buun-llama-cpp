@@ -306,7 +306,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_DFLASH_BLOCK_SIZE,       "%s.dflash.block_size"        },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,    "%s.dflash.mask_token_id"     },
-    { LLM_KV_DFLASH_TARGET_LAYER_IDS, "%s.dflash.target_layer_ids"  },
+    { LLM_KV_DFLASH_TARGET_LAYER_IDS, "%s.dflash.target_layers"  },
     { LLM_KV_DFLASH_N_TARGET_FEATURES,"%s.dflash.n_target_features" },
 
     { LLM_KV_POSNET_EMBEDDING_LENGTH, "%s.posnet.embedding_length" },

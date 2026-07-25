@@ -20,6 +20,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.dflash_n_target_layers = (uint32_t) target_layer_ids.size();
     hparams.dflash_n_target_features = hparams.dflash_n_target_layers * hparams.n_embd;
+
+    // Copy to hparams for llama_model_dflash_target_layer_ids() access
+    for (uint32_t i = 0; i < hparams.dflash_n_target_layers && i < 8; ++i) {
+        hparams.dflash_target_layer_ids[i] = (uint32_t) target_layer_ids[i];
+    }
     hparams.n_embd_inp_enc_impl = hparams.dflash_n_target_features;
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);

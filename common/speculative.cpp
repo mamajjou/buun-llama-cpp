@@ -1105,6 +1105,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
+            // A target verification batch starts where the preceding noise
+            // block started. Remove that temporary block before replacing it
+            // with target-derived injected K/V at the same positions.
+            const llama_pos pos_first = batch_in.pos[i_batch_beg[seq_id]];
+            if (pos_first < 0) {
+                LOG_ERR("%s: invalid first target position for seq=%d: %d\n",
+                        __func__, (int) seq_id, (int) pos_first);
+                return false;
+            }
+            auto * memory = llama_get_memory(ctx_dft);
+            const llama_pos pmax_before = llama_memory_seq_pos_max(memory, seq_id);
+            if (pmax_before >= pos_first) {
+                llama_memory_seq_rm(memory, seq_id, pos_first, -1);
+                const llama_pos pmax_after = llama_memory_seq_pos_max(memory, seq_id);
+                if (pmax_after >= pos_first) {
+                    LOG_ERR("%s: failed to clear overlapping draft K/V for seq=%d: pmax=%d, pos_first=%d\n",
+                            __func__, (int) seq_id, (int) pmax_after, (int) pos_first);
+                    return false;
+                }
+                LOG_DBG("%s: cleared overlapping draft K/V seq=%d pmax=%d->%d pos_first=%d\n",
+                        __func__, (int) seq_id, (int) pmax_before, (int) pmax_after, (int) pos_first);
+            }
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1203,6 +1226,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+
+            // process() has injected the full verification batch. Keep only
+            // the accepted target prefix [0, dp.n_past); rows at or beyond
+            // dp.n_past are rejected verification rows or stale noise state.
+            auto * memory = llama_get_memory(ctx_dft);
+            const llama_pos pmax_before = llama_memory_seq_pos_max(memory, seq_id);
+
+            llama_memory_seq_rm(memory, seq_id, dp.n_past, -1);
+
+            const llama_pos pmax_after = llama_memory_seq_pos_max(memory, seq_id);
+            if (pmax_after >= dp.n_past) {
+                LOG_ERR("%s: failed to roll back draft suffix for seq=%d: pmax=%d, n_past=%d\n",
+                        __func__, (int) seq_id, (int) pmax_after, (int) dp.n_past);
+                continue;
+            }
+
+            LOG_DBG("%s: rolled back draft suffix seq=%d pmax=%d->%d n_past=%d\n",
+                    __func__, (int) seq_id, (int) pmax_before, (int) pmax_after, (int) dp.n_past);
 
             common_sampler_reset(smpls[seq_id].get());
 
@@ -2719,6 +2760,27 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         return cross_len;
     }
 
+    // The cross-attention ring owns all committed target context. The normal
+    // drafter KV contains only the previous speculative noise block, so it must
+    // not survive into the next block. Leaving it resident makes the next batch
+    // start behind memory->seq_pos_max() and fails batch validation.
+    void reset_draft_self_kv(int cross_len) {
+        const llama_pos pmax_before = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        if (pmax_before >= 0) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, -1);
+        }
+
+        const llama_pos pmax_after = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (pmax_after >= 0) {
+            LOG_WRN("dflash: failed to clear draft self KV for seq=%d (pmax=%d, cross_len=%d)\n",
+                    (int) seq_id, (int) pmax_after, cross_len);
+        }
+
+        LOG_DBG("dflash: reset draft self KV seq=%d pmax=%d->%d cross_len=%d\n",
+                (int) seq_id, (int) pmax_before, (int) pmax_after, cross_len);
+    }
+
     llama_batch batch_dft;
 
     common_speculative_impl_dflash(
@@ -2806,8 +2868,11 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     // called after initial prefill — extract hidden states from target
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
+    void begin(llama_seq_id seq_id_, const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        seq_id = seq_id_;
+        reset_draft_self_kv(0);
+
         if (prefill_flushed) {
             // ring was already populated incrementally by flush_prefill() calls
             // during checkpoint-split prefill — nothing to do
@@ -2960,6 +3025,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             const int64_t t0 = ggml_time_us();
 
             int cross_len = build_cross_data(ctx_dft);
+            reset_draft_self_kv(cross_len);
 
             const int64_t t1 = ggml_time_us();
 
@@ -3064,6 +3130,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         const int64_t t0 = ggml_time_us();
 
         int cross_len = build_cross_data(ctx_dft);
+        reset_draft_self_kv(cross_len);
 
         common_batch_clear(batch_dft);
         common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);

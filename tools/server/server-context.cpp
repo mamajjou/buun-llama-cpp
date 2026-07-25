@@ -1679,22 +1679,26 @@ private:
             }
 
             // Auto-detect DFlash from drafter model architecture
+            // Do not override explicit --spec-type draft-dflash
             if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
-                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
                 params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
                 SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
                         llama_model_dflash_block_size(model_dft.get()));
             }
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            const bool is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+            const bool is_draft_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+
+            if (is_dflash || is_draft_dflash) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
-                params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
+                if (is_dflash) {
+                    params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
+                }
                 params_dft.n_parallel = std::max(1,
                     std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
 
-                // --spec-dflash-default leaves draft-max at -1 = auto: the drafter emits
-                // at most block_size - 1 tokens per step and the full depth strictly wins
-                // (EXP-37i depth sweep) — resolve it here so slot task defaults see it
                 if (params_base.speculative.n_max < 0) {
                     params_base.speculative.n_max = block_size > 1 ? block_size - 1 : 12;
                     SRV_INF("draft-max auto (DFlash): %d (drafter block_size %d)\n",
@@ -1704,11 +1708,25 @@ private:
 
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
-            // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (is_dflash) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
+            }
+
+            // Create draft context for draft-dflash encoder path
+            if (is_draft_dflash) {
+                auto cparams = common_context_params_to_llama(params_dft);
+                cparams.n_batch = params_base.n_batch;
+                cparams.ctx_other = ctx_tgt;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create DFlash draft context\n");
+                    return false;
+                }
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
 
             // Upstream MTP: create draft context from target model's MTP heads
