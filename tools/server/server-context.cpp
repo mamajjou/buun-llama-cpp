@@ -338,8 +338,8 @@ struct server_slot {
     int64_t t_spec_recovery_us = 0;
 
     // draft-dflash is profitable only when a verified block amortizes its
-    // extra drafter + batched-target pass. Calibrate against one ordinary
-    // target token at the request's actual context, then make request-local
+    // extra drafter + batched-target pass. Calibrate against two ordinary
+    // target tokens at the request's actual context, then make request-local
     // decisions from measured block wall time. These fields must never survive
     // slot reuse: a cached prefix can have a radically different decode cost.
     bool spec_adaptive_baseline_ready = false;
@@ -347,7 +347,9 @@ struct server_slot {
     int32_t spec_adaptive_decisions = 0;
     int32_t spec_adaptive_window_blocks = 0;
     int32_t spec_adaptive_window_outputs = 0;
+    int32_t spec_adaptive_target_samples = 0;
     int64_t spec_adaptive_target_us = 0;
+    int64_t spec_adaptive_target_sum_us = 0;
     int64_t spec_adaptive_target_start_us = 0;
     int64_t spec_adaptive_window_us = 0;
     int64_t spec_adaptive_block_start_us = 0;
@@ -396,7 +398,9 @@ struct server_slot {
         spec_adaptive_decisions = 0;
         spec_adaptive_window_blocks = 0;
         spec_adaptive_window_outputs = 0;
+        spec_adaptive_target_samples = 0;
         spec_adaptive_target_us = 0;
+        spec_adaptive_target_sum_us = 0;
         spec_adaptive_target_start_us = 0;
         spec_adaptive_window_us = 0;
         spec_adaptive_block_start_us = 0;
@@ -519,8 +523,8 @@ struct server_slot {
             return 0;
         }
 
-        // The first post-prefill token is deliberately decoded normally to
-        // calibrate target latency. A losing request then remains target-only,
+        // The first two post-prefill tokens are deliberately decoded normally
+        // to calibrate target latency. A losing request then remains target-only,
         // while common_speculative_update_logits() keeps the DFlash ring
         // synchronized on every ordinary token. Output is always target sampled.
         if (uses_adaptive_dflash() &&
@@ -542,13 +546,6 @@ struct server_slot {
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
-        }
-
-        // The first profitability window uses one-token proposals. This bounds
-        // the cost of short tool/special-token transitions that may finish
-        // before a four-block decision, then expands to the requested depth.
-        if (uses_adaptive_dflash() && spec_adaptive_decisions == 0) {
-            n_draft_max = std::min(n_draft_max, 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -4087,10 +4084,7 @@ private:
                     draft = std::move(batched_drafts[slot.id]);
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-                    auto params_spec = slot.task->params.speculative;
-                    if (slot.uses_adaptive_dflash() && slot.spec_adaptive_decisions == 0) {
-                        params_spec.n_max = std::min(params_spec.n_max, 1);
-                    }
+                    const auto & params_spec = slot.task->params.speculative;
                     const llama_pos n_past = slot.prompt.tokens.pos_next();
                     draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
                 }
@@ -4946,8 +4940,8 @@ private:
             return false; // retry with the updated n_batch
         }
 
-        // A draft-dflash request starts with one ordinary post-prefill target
-        // decode. It measures the target token cost at the live context and KV
+        // A draft-dflash request starts with two ordinary post-prefill target
+        // decodes. They measure target cost at the live context and KV
         // state; using a fixed global latency would make cache-reused Pi turns
         // choose from the wrong break-even point. Parallel=1 is the supported
         // production contract, so require an isolated one-token decode.
@@ -5173,11 +5167,19 @@ private:
             if (slot.uses_adaptive_dflash() &&
                 !slot.spec_adaptive_baseline_ready &&
                 slot.spec_adaptive_target_start_us > 0) {
-                slot.spec_adaptive_target_us =
+                const int64_t target_sample_us =
                     std::max<int64_t>(1, t_now - slot.spec_adaptive_target_start_us);
+                slot.spec_adaptive_target_sum_us += target_sample_us;
+                slot.spec_adaptive_target_samples++;
+                slot.spec_adaptive_target_us =
+                    slot.spec_adaptive_target_sum_us / slot.spec_adaptive_target_samples;
                 slot.spec_adaptive_target_start_us = 0;
-                slot.spec_adaptive_baseline_ready = true;
-                SLT_INF(slot, "adaptive draft-dflash target baseline: %.2f ms/token\n",
+                slot.spec_adaptive_baseline_ready = slot.spec_adaptive_target_samples >= 2;
+                SLT_INF(slot,
+                        "adaptive draft-dflash target baseline sample %d/2: %.2f ms/token "
+                        "(mean %.2f ms)\n",
+                        slot.spec_adaptive_target_samples,
+                        target_sample_us / 1e3,
                         slot.spec_adaptive_target_us / 1e3);
             }
 
@@ -5352,10 +5354,11 @@ private:
                 slot.spec_adaptive_window_outputs += ids.size(); // accepted draft tokens + target bonus
                 slot.spec_adaptive_window_us += block_us;
 
-                // Four blocks reject a losing phase quickly; profitable phases
-                // are rechecked in eight-block windows. The 0.97 margin requires
-                // a measured 3% win before keeping the extra model active.
-                const int decision_blocks = slot.spec_adaptive_decisions == 0 ? 4 : 8;
+                // Three blocks reject a losing phase quickly; profitable phases
+                // are rechecked in eight-block windows. Requiring a predicted
+                // 10% win covers short-block boundary cost and matches the
+                // production success threshold.
+                const int decision_blocks = slot.spec_adaptive_decisions == 0 ? 3 : 8;
                 if (slot.spec_adaptive_window_blocks >= decision_blocks &&
                     slot.spec_adaptive_window_outputs > 0 &&
                     slot.spec_adaptive_target_us > 0) {
@@ -5365,7 +5368,7 @@ private:
                         slot.spec_adaptive_window_us / target_only_us;
                     slot.spec_adaptive_decisions++;
 
-                    if (slot.spec_adaptive_last_ratio > 0.97) {
+                    if (slot.spec_adaptive_last_ratio > 0.90) {
                         slot.spec_adaptive_disabled = true;
                         SLT_INF(slot,
                                 "adaptive draft-dflash disabled: blocks=%d outputs=%d "
