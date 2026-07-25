@@ -338,7 +338,7 @@ struct server_slot {
     int64_t t_spec_recovery_us = 0;
 
     // draft-dflash is profitable only when a verified block amortizes its
-    // extra drafter + batched-target pass. Calibrate against two ordinary
+    // extra drafter + batched-target pass. Calibrate against 32 ordinary
     // target tokens at the request's actual context, then make request-local
     // decisions from measured block wall time. These fields must never survive
     // slot reuse: a cached prefix can have a radically different decode cost.
@@ -523,7 +523,7 @@ struct server_slot {
             return 0;
         }
 
-        // The first two post-prefill tokens are deliberately decoded normally
+        // The first 32 post-prefill tokens are deliberately decoded normally
         // to calibrate target latency. A losing request then remains target-only,
         // while common_speculative_update_logits() keeps the DFlash ring
         // synchronized on every ordinary token. Output is always target sampled.
@@ -4940,7 +4940,7 @@ private:
             return false; // retry with the updated n_batch
         }
 
-        // A draft-dflash request starts with two ordinary post-prefill target
+        // A draft-dflash request starts with 32 ordinary post-prefill target
         // decodes. They measure target cost at the live context and KV
         // state; using a fixed global latency would make cache-reused Pi turns
         // choose from the wrong break-even point. Parallel=1 is the supported
@@ -5174,13 +5174,23 @@ private:
                 slot.spec_adaptive_target_us =
                     slot.spec_adaptive_target_sum_us / slot.spec_adaptive_target_samples;
                 slot.spec_adaptive_target_start_us = 0;
-                slot.spec_adaptive_baseline_ready = slot.spec_adaptive_target_samples >= 2;
-                SLT_INF(slot,
-                        "adaptive draft-dflash target baseline sample %d/2: %.2f ms/token "
-                        "(mean %.2f ms)\n",
-                        slot.spec_adaptive_target_samples,
-                        target_sample_us / 1e3,
-                        slot.spec_adaptive_target_us / 1e3);
+                slot.spec_adaptive_baseline_ready = slot.spec_adaptive_target_samples >= 32;
+                if (slot.spec_adaptive_target_samples == 1 ||
+                    slot.spec_adaptive_baseline_ready) {
+                    SLT_INF(slot,
+                            "adaptive draft-dflash target baseline sample %d/32: %.2f ms/token "
+                            "(mean %.2f ms)\n",
+                            slot.spec_adaptive_target_samples,
+                            target_sample_us / 1e3,
+                            slot.spec_adaptive_target_us / 1e3);
+                } else {
+                    SLT_DBG(slot,
+                            "adaptive draft-dflash target baseline sample %d/32: %.2f ms/token "
+                            "(mean %.2f ms)\n",
+                            slot.spec_adaptive_target_samples,
+                            target_sample_us / 1e3,
+                            slot.spec_adaptive_target_us / 1e3);
+                }
             }
 
             slot.n_decoded += 1;
