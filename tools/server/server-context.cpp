@@ -28,6 +28,7 @@
 #include <random>
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <fstream>
 
@@ -693,8 +694,10 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
-        if (n_draft_total > 0) {
-            const float  draft_ratio  = (float) n_draft_accepted / n_draft_total;
+        if (n_draft_attempts > 0) {
+            const float  draft_ratio  = n_draft_total > 0
+                ? (float) n_draft_accepted / n_draft_total
+                : 0.0f;
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
 
             std::string acceptance_rates_per_pos;
