@@ -272,9 +272,19 @@ struct result_timings {
     double predicted_per_token_ms = 0.0;
     double predicted_per_second = 0.0;
 
-    // Optional speculative metrics - only included when > 0
+    // Optional per-request speculative metrics. These are kept separate from
+    // the process-lifetime common_speculative counters so cached/multi-turn
+    // requests cannot contaminate one another's benchmark results.
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    int32_t draft_attempts = 0;
+    int32_t draft_nonempty = 0;
+    int32_t draft_empty = 0;
+    std::vector<int32_t> draft_proposed_per_pos;
+    std::vector<int32_t> draft_accepted_per_pos;
+    double draft_ms = 0.0;
+    double draft_verify_ms = 0.0;
+    double draft_recovery_ms = 0.0;
 
     // effective bits/value of the attention KV cache at its current tensor types (moves at
     // runtime under dynamic VBR); emitted only when >= 0

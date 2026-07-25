@@ -268,9 +268,17 @@ json result_timings::to_json() const {
         {"predicted_per_second",   predicted_per_second},
     };
 
-    if (draft_n > 0) {
+    if (draft_attempts > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["draft_attempts"] = draft_attempts;
+        base["draft_nonempty"] = draft_nonempty;
+        base["draft_empty"] = draft_empty;
+        base["draft_proposed_per_pos"] = draft_proposed_per_pos;
+        base["draft_accepted_per_pos"] = draft_accepted_per_pos;
+        base["draft_ms"] = draft_ms;
+        base["draft_verify_ms"] = draft_verify_ms;
+        base["draft_recovery_ms"] = draft_recovery_ms;
     }
 
     if (kv_bpv >= 0.0) {

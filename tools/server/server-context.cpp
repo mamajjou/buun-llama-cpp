@@ -328,7 +328,13 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    int32_t n_draft_attempts = 0;   // Includes empty/declined proposals
+    int32_t n_draft_empty = 0;
+    std::vector<int32_t> n_proposed_per_pos; // Denominator for each draft position
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
+    int64_t t_spec_draft_us = 0;
+    int64_t t_spec_verify_us = 0;
+    int64_t t_spec_recovery_us = 0;
 
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
@@ -361,7 +367,13 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
+        n_draft_attempts = 0;
+        n_draft_empty = 0;
+        n_proposed_per_pos.clear();
         n_accepted_per_pos.clear();
+        t_spec_draft_us = 0;
+        t_spec_verify_us = 0;
+        t_spec_recovery_us = 0;
         has_draft_backup = false;
         seq_id_backup = -1;
         n_tokens_before_draft = 0;
@@ -574,9 +586,17 @@ struct server_slot {
         timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
 
         // Add speculative metrics
-        if (n_draft_total > 0) {
+        if (n_draft_attempts > 0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_attempts = n_draft_attempts;
+            timings.draft_nonempty = n_draft_verif_steps;
+            timings.draft_empty = n_draft_empty;
+            timings.draft_proposed_per_pos = n_proposed_per_pos;
+            timings.draft_accepted_per_pos = n_accepted_per_pos;
+            timings.draft_ms = t_spec_draft_us / 1e3;
+            timings.draft_verify_ms = t_spec_verify_us / 1e3;
+            timings.draft_recovery_ms = t_spec_recovery_us / 1e3;
         }
 
         // live effective KV bits/value (moves under dynamic VBR as tiers degrade/reset)
@@ -683,7 +703,10 @@ struct server_slot {
                     if (i > 0) {
                         acceptance_rates_per_pos += ", ";
                     }
-                    acceptance_rates_per_pos += string_format("%.3f", (double) n_accepted_per_pos[i] / (double) n_draft_verif_steps);
+                    const int32_t n_proposed = i < n_proposed_per_pos.size() ? n_proposed_per_pos[i] : 0;
+                    acceptance_rates_per_pos += n_proposed > 0
+                        ? string_format("%.3f", (double) n_accepted_per_pos[i] / (double) n_proposed)
+                        : "n/a";
                 }
             }
 
@@ -692,6 +715,10 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+            SLT_INF(*this,
+                    "spec request = attempts=%d nonempty=%d empty=%d draft_ms=%.3f verify_ms=%.3f recovery_ms=%.3f\n",
+                    n_draft_attempts, n_draft_verif_steps, n_draft_empty,
+                    t_spec_draft_us / 1e3, t_spec_verify_us / 1e3, t_spec_recovery_us / 1e3);
         }
 
         common_speculative_print_stats(spec.get());
@@ -3996,6 +4023,7 @@ private:
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
+                slot.n_draft_attempts++;
 
                 llama_tokens draft;
                 if (!batched_drafts[slot.id].empty()) {
@@ -4026,12 +4054,24 @@ private:
                 // slot.sampled every step until a real draft breaks the
                 // idxs.size() == draft.size() + 1 invariant (#74)
                 if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
+                    slot.n_draft_empty++;
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     slot.i_batch = slot.spec_i_batch[0];
                     slot.spec_draft.clear();
                     slot.spec_i_batch.clear();
                 } else {
                     slot.n_draft_total += draft.size();
+                    if (slot.n_proposed_per_pos.size() < draft.size()) {
+                        slot.n_proposed_per_pos.resize(draft.size(), 0);
+                    }
+                    for (size_t i = 0; i < draft.size(); ++i) {
+                        slot.n_proposed_per_pos[i]++;
+                    }
+                    SLT_DBG(slot,
+                            "spec block: attempt=%d cap=%d proposed=%d n_past=%d type=%s\n",
+                            slot.n_draft_attempts, n_draft_max, (int) draft.size(),
+                            slot.n_tokens_before_draft,
+                            common_speculative_type_name_str(slot.task->params.speculative.types).c_str());
 
                     // keep the spec checkpoint's position bookkeeping current (upstream #24536 family);
                     // the fork accept loop rolls back via backup seqs / seq_rm, so only the cheap
@@ -4080,7 +4120,9 @@ private:
                     }
                     slot.spec_draft = std::move(draft);
                 }
-                t_draft_total += ggml_time_us() - t_draft_slot_start;
+                const int64_t t_draft_slot = ggml_time_us() - t_draft_slot_start;
+                slot.t_spec_draft_us += t_draft_slot;
+                t_draft_total += t_draft_slot;
                 n_slots_drafted++;
             } else {
                 slot.i_batch = batch.size();
@@ -4773,6 +4815,22 @@ private:
         const int ret = llama_decode(ctx_tgt, batch_view);
         const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
         t_verify_total += t_verify_elapsed;
+        // A verification batch may contain more than one sequence. Each slot
+        // experiences the full overlapped wall time, so charge it once to every
+        // speculative sequence present instead of dividing by token count.
+        std::unordered_set<llama_seq_id> verified_slots;
+        for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+            for (int32_t j = 0; j < batch_view.n_seq_id[i]; ++j) {
+                const llama_seq_id seq_id = batch_view.seq_id[i][j];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) slots.size() &&
+                    !slots[seq_id].spec_draft.empty()) {
+                    verified_slots.insert(seq_id);
+                }
+            }
+        }
+        for (const llama_seq_id seq_id : verified_slots) {
+            slots[seq_id].t_spec_verify_us += t_verify_elapsed;
+        }
         SRV_DBG("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
                 batch_view.n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, batch_view.n_tokens));
 
@@ -5143,6 +5201,7 @@ private:
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
             slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
 
+            const int64_t t_recovery_start = ggml_time_us();
             if (slot.has_draft_backup) {
                 const llama_seq_id seq_backup = slot.seq_id_backup;
                 const bool all_accepted = (ids.size() == n_draft + 1);
@@ -5191,6 +5250,7 @@ private:
             }
 
             common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t)(ids.size() - 1));
+            slot.t_spec_recovery_us += ggml_time_us() - t_recovery_start;
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
